@@ -1,0 +1,17 @@
+# datasets - don't upload, use the link in README instead
+data/raw_predictions.csv
+data/features.csv
+data/feature_stats.csv
+
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# mac
+.DS_Store
+
+
+# jupyter
+.ipynb_checkpoints/

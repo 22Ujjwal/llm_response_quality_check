@@ -1,0 +1,650 @@
+===== ./data/feature_extraction.py =====
+import os
+import pandas as pd
+
+DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+INPUT_PATH = os.path.join(DATA_DIR, "raw_predictions.csv")
+OUTPUT_PATH = os.path.join(DATA_DIR, "features.csv")
+
+# drop any col that directly encodes the label, straight up leakage otherwise
+EXCLUDE_COLS = {"model_id", "label", "acc_gap", "reasoning_score", "knowledge_score", "total_score", "gpqa_acc"}
+
+
+def get_feature_columns(df):
+    return [
+        c for c in df.columns
+        if c not in EXCLUDE_COLS and pd.api.types.is_numeric_dtype(df[c])
+    ]
+
+#by ug
+def main():
+    if not os.path.exists(INPUT_PATH):
+        print(f"Input not found: {INPUT_PATH}\nRun load_dataset.py first.")
+        return
+
+    df = pd.read_csv(INPUT_PATH).dropna()
+    print(f"Loaded {len(df)} rows")
+
+    feature_cols = get_feature_columns(df)
+    print(f"Features ({len(feature_cols)}): {feature_cols}")
+
+    # clean features + label only, keeping train.py honest
+    df[["model_id"] + feature_cols + ["label"]].to_csv(OUTPUT_PATH, index=False)
+    print(f"\nLabel distribution:\n{df['label'].value_counts().to_string()}")
+    print(f"Saved {len(df)} rows to {OUTPUT_PATH}")
+
+
+if __name__ == "__main__":
+    main()
+
+===== ./data/load_dataset.py =====
+import json
+import os
+import random
+import pandas as pd
+from huggingface_hub import list_repo_files, hf_hub_download
+from tqdm import tqdm
+
+DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_PATH = os.path.join(DATA_DIR, "raw_predictions.csv")
+
+# reasoning tasks = can't just vibe off memorized facts, actual multi-step thinking required
+REASONING_TASKS = {
+    "leaderboard_bbh":       ("acc_norm,none",    "bbh_acc"),
+    "leaderboard_math_hard": ("exact_match,none", "math_acc"),
+    "leaderboard_musr":      ("acc_norm,none",    "musr_acc"),
+}
+KNOWLEDGE_TASKS = {
+    "leaderboard_mmlu_pro":  ("acc,none",         "mmlu_pro_acc"),
+    "leaderboard_gpqa":      ("acc_norm,none",    "gpqa_acc"),
+}
+ALL_TASKS = {**REASONING_TASKS, **KNOWLEDGE_TASKS}
+
+BBH_SUBTASKS = [
+    "leaderboard_bbh_boolean_expressions",
+    "leaderboard_bbh_causal_judgement",
+    "leaderboard_bbh_date_understanding",
+    "leaderboard_bbh_logical_deduction_five_objects",
+    "leaderboard_bbh_logical_deduction_seven_objects",
+    "leaderboard_bbh_logical_deduction_three_objects",
+    "leaderboard_bbh_navigate",
+    "leaderboard_bbh_object_counting",
+    "leaderboard_bbh_penguins_in_a_table",
+    "leaderboard_bbh_web_of_lies",
+]
+
+
+def list_result_files(model_limit=300, seed=42):
+    print("Listing result files in leaderboard repo...")
+    all_files = [
+        f for f in list_repo_files("open-llm-leaderboard/results", repo_type="dataset")
+        if f.endswith(".json")
+    ]
+    print(f"  Total JSON files: {len(all_files)}")
+
+    model_latest = {}
+    for f in all_files:
+        parts = f.split("/")
+        if len(parts) >= 3:
+            model_key = "/".join(parts[:2])
+            model_latest[model_key] = f
+        else:
+            model_latest[f] = f
+
+    unique_files = list(model_latest.values())
+    random.seed(seed)
+    sampled = random.sample(unique_files, min(model_limit, len(unique_files)))
+    print(f"  Sampled {len(sampled)} model files")
+    return sampled
+
+
+def parse_result_file(path, data):
+    results = data.get("results", {})
+    if not isinstance(results, dict) or not results:
+        return None
+
+    model_id = data.get("model_name", "/".join(path.split("/")[:2]) if "/" in path else path)
+    row = {"model_id": model_id}
+
+    has_all_tasks = True
+    for task_key, (metric, col_name) in ALL_TASKS.items():
+        task_data = results.get(task_key, {})
+        val = task_data.get(metric, None)
+        if val is None:
+            has_all_tasks = False
+            row[col_name] = None
+        else:
+            row[col_name] = float(val)
+
+    if not has_all_tasks:
+        return None
+
+    for subtask in BBH_SUBTASKS:
+        task_data = results.get(subtask, {})
+        val = task_data.get("acc_norm,none", None)
+        col = subtask.replace("leaderboard_bbh_", "bbh_sub_")
+        row[col] = float(val) if val is not None else None
+
+    reasoning_scores = [row["bbh_acc"], row["math_acc"], row["musr_acc"]]
+    knowledge_scores = [row["mmlu_pro_acc"], row["gpqa_acc"]]
+
+    row["reasoning_score"] = sum(reasoning_scores) / len(reasoning_scores)
+    row["knowledge_score"] = sum(knowledge_scores) / len(knowledge_scores)
+    row["acc_gap"] = row["reasoning_score"] - row["knowledge_score"]
+    row["score_variance"] = pd.Series(reasoning_scores + knowledge_scores).var()
+    row["total_score"] = sum(reasoning_scores + knowledge_scores) / len(reasoning_scores + knowledge_scores)
+
+    return row
+
+
+def download_and_parse(file_paths):
+    records = []
+    failed = 0
+
+    for fpath in tqdm(file_paths, desc="Downloading model results"):
+        try:
+            local = hf_hub_download(
+                repo_id="open-llm-leaderboard/results",
+                filename=fpath,
+                repo_type="dataset",
+            )
+            with open(local) as f:
+                data = json.load(f)
+
+            row = parse_result_file(fpath, data)
+            if row is not None:
+                records.append(row)
+
+        except Exception:
+            failed += 1
+            continue
+
+    print(f"  Parsed {len(records)} models ({failed} failed/skipped)")
+    return records
+
+#by ug
+def main():
+    file_paths = list_result_files(model_limit=1000)
+    records = download_and_parse(file_paths)
+
+    if not records:
+        print("No records parsed. Check HF token or network.")
+        return
+
+    df = pd.DataFrame(records).dropna()
+    print(f"\n  Final dataset: {len(df)} models")
+
+    # gpqa held out as label, no leakage fr
+    df["label"] = (df["gpqa_acc"] > df["gpqa_acc"].median()).astype(int)
+    print(f"  Label distribution:\n{df['label'].value_counts().to_string()}")
+
+    df.to_csv(OUTPUT_PATH, index=False)
+    print(f"\nSaved to {OUTPUT_PATH}")
+
+
+if __name__ == "__main__":
+    main()
+
+===== ./evaluate.py =====
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import (
+    confusion_matrix, classification_report,
+    roc_curve, auc
+)
+
+RESULTS_DIR = "results"
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+
+def plot_confusion_matrix(y_true, y_pred, title, filename):
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax,
+                xticklabels=["Memorization", "Reasoning"],
+                yticklabels=["Memorization", "Reasoning"])
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title(title)
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, filename)
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"Saved: {path}")
+
+
+def plot_roc_curve(models_data, filename):
+    fig, ax = plt.subplots(figsize=(6, 5))
+    for name, y_true, y_prob in models_data:
+        if len(np.unique(y_true)) < 2:
+            continue
+        fpr, tpr, _ = roc_curve(y_true, y_prob)
+        roc_auc = auc(fpr, tpr)
+        ax.plot(fpr, tpr, label=f"{name} (AUC={roc_auc:.3f})", linewidth=2)
+    ax.plot([0, 1], [0, 1], "k--", linewidth=1)
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("ROC Curve")
+    ax.legend()
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, filename)
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"Saved: {path}")
+
+
+def plot_training_loss(train_losses, val_losses=None, filename="training_loss.png"):
+    fig, ax = plt.subplots(figsize=(7, 4))
+    epochs = range(1, len(train_losses) + 1)
+    ax.plot(epochs, train_losses, label="Train Loss", linewidth=2)
+    if val_losses is not None and len(val_losses) > 0:
+        ax.plot(epochs, val_losses, label="Val Loss", linewidth=2, linestyle="--")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Binary Cross-Entropy Loss")
+    ax.set_title("Training Curve")
+    ax.legend()
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, filename)
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"Saved: {path}")
+
+
+def plot_feature_importance(weights_path, filename="feature_importance.png"):
+    # green = pushes toward high GPQA, red = opposite, color-coded for quick reads
+    df = pd.read_csv(weights_path).sort_values("weight")
+    fig, ax = plt.subplots(figsize=(7, max(4, len(df) * 0.4)))
+    colors = ["#d73027" if w < 0 else "#1a9850" for w in df["weight"]]
+    ax.barh(df["feature"], df["weight"], color=colors)
+    ax.axvline(0, color="black", linewidth=0.8)
+    ax.set_xlabel("Weight")
+    ax.set_title("Logistic Regression Feature Weights\n(positive → reasoning, negative → memorization)")
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, filename)
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"Saved: {path}")
+
+
+def print_metrics_table(models_preds):
+    from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+    print("\n" + "=" * 65)
+    print(f"{'Model':<25} {'Accuracy':>10} {'F1':>10} {'Precision':>10} {'Recall':>10}")
+    print("-" * 65)
+    for name, y_true, y_pred in models_preds:
+        print(f"{name:<25} "
+              f"{accuracy_score(y_true, y_pred):>10.4f} "
+              f"{f1_score(y_true, y_pred, zero_division=0):>10.4f} "
+              f"{precision_score(y_true, y_pred, zero_division=0):>10.4f} "
+              f"{recall_score(y_true, y_pred, zero_division=0):>10.4f}")
+    print("=" * 65)
+
+#by ug
+def main():
+    lr_path = os.path.join(RESULTS_DIR, "logistic_regression_predictions.csv")
+    base_path = os.path.join(RESULTS_DIR, "baseline_predictions.csv")
+
+    if not os.path.exists(lr_path):
+        print("No predictions found. Run train.py first.")
+        return
+
+    lr_df = pd.read_csv(lr_path)
+    y_true = lr_df["true"].values
+    lr_pred = lr_df["pred"].values
+    lr_prob = lr_df["prob"].values
+
+    models_preds = [("LogisticRegression", y_true, lr_pred)]
+    models_roc = [("LogisticRegression", y_true, lr_prob)]
+
+    if os.path.exists(base_path):
+        base_df = pd.read_csv(base_path)
+        base_pred = base_df["pred"].values
+        base_prob = base_df["prob"].values
+        models_preds.append(("ThresholdBaseline", y_true, base_pred))
+        models_roc.append(("ThresholdBaseline", y_true, base_prob))
+
+    print("\nLogistic Regression Classification Report:")
+    print(classification_report(y_true, lr_pred,
+                                target_names=["Memorization", "Reasoning"],
+                                zero_division=0))
+
+    print_metrics_table(models_preds)
+
+    plot_confusion_matrix(y_true, lr_pred,
+                          "Confusion Matrix: Logistic Regression",
+                          "confusion_matrix_lr.png")
+
+    if os.path.exists(base_path):
+        plot_confusion_matrix(y_true, base_pred,
+                              "Confusion Matrix: Baseline",
+                              "confusion_matrix_baseline.png")
+
+    plot_roc_curve(models_roc, "roc_curve.png")
+
+    train_losses_path = os.path.join(RESULTS_DIR, "train_losses.npy")
+    val_losses_path = os.path.join(RESULTS_DIR, "val_losses.npy")
+    if os.path.exists(train_losses_path):
+        train_losses = np.load(train_losses_path)
+        val_losses = np.load(val_losses_path) if os.path.exists(val_losses_path) else None
+        plot_training_loss(train_losses, val_losses)
+
+    weights_path = os.path.join(RESULTS_DIR, "feature_weights.csv")
+    if os.path.exists(weights_path):
+        plot_feature_importance(weights_path)
+
+    print("\nAll plots saved to results/")
+
+
+if __name__ == "__main__":
+    main()
+
+===== ./models/baseline.py =====
+import numpy as np
+
+
+# intentionally dumb rule-based baseline, sets the floor our LR needs to beat
+class ThresholdBaseline:
+    def __init__(self, feature_names, correct_idx=None, margin_idx=None, margin_threshold=0.0):
+        self.feature_names = list(feature_names)
+        self.correct_idx = correct_idx
+        self.margin_idx = margin_idx
+        self.margin_threshold = margin_threshold
+
+    def fit(self, X, y):
+        if self.correct_idx is None and "is_correct" in self.feature_names:
+            self.correct_idx = self.feature_names.index("is_correct")
+        if self.margin_idx is None and "logit_margin" in self.feature_names:
+            self.margin_idx = self.feature_names.index("logit_margin")
+
+        if self.margin_idx is not None:
+            margins = X[:, self.margin_idx]
+            best_acc, best_thresh = 0, 0
+            for t in np.linspace(margins.min(), margins.max(), 50):
+                preds = self._threshold_predict(X, t)
+                acc = np.mean(preds == y)
+                if acc > best_acc:
+                    best_acc = acc
+                    best_thresh = t
+            self.margin_threshold = best_thresh
+
+        return self
+
+    def _threshold_predict(self, X, threshold):
+        preds = np.zeros(len(X), dtype=int)
+        if self.correct_idx is not None and self.margin_idx is not None:
+            correct = X[:, self.correct_idx] > 0
+            high_margin = X[:, self.margin_idx] > threshold
+            preds = (correct & high_margin).astype(int)
+        elif self.correct_idx is not None:
+            preds = (X[:, self.correct_idx] > 0).astype(int)
+        return preds
+
+    def predict(self, X, threshold=None):
+        t = threshold if threshold is not None else self.margin_threshold
+        return _threshold_predict(X, t) if threshold else self._threshold_predict(X, self.margin_threshold)
+
+    def predict_proba(self, X):
+        if self.margin_idx is not None:
+            raw = X[:, self.margin_idx]
+            shifted = raw - raw.min()
+            denom = shifted.max() if shifted.max() > 0 else 1
+            return shifted / denom
+        return np.ones(len(X)) * 0.5
+
+===== ./models/logistic_regression.py =====
+import numpy as np
+
+
+class LogisticRegression:
+    def __init__(self, learning_rate=0.01, num_epochs=1000, batch_size=32,
+                 l2_lambda=0.01, verbose=True, random_state=42):
+        self.learning_rate = learning_rate
+        self.num_epochs = num_epochs
+        self.batch_size = batch_size
+        self.l2_lambda = l2_lambda
+        self.verbose = verbose
+        self.random_state = random_state
+        self.weights = None
+        self.bias = None
+        self.train_losses = []
+        self.val_losses = []
+
+    def _sigmoid(self, z):
+        # piecewise sigmoid split at 0, keeps gradients from going cooked
+        return np.where(z >= 0,
+                        1 / (1 + np.exp(-z)),
+                        np.exp(z) / (1 + np.exp(z)))
+
+    def _binary_cross_entropy(self, y_true, y_pred):
+        eps = 1e-9
+        y_pred = np.clip(y_pred, eps, 1 - eps)
+        bce = -np.mean(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred))
+        l2_penalty = (self.l2_lambda / 2) * np.sum(self.weights ** 2)
+        return bce + l2_penalty
+
+    def _forward(self, X):
+        z = X @ self.weights + self.bias
+        return self._sigmoid(z)
+
+    def _compute_gradients(self, X, y_true, y_pred):
+        n = len(y_true)
+        error = y_pred - y_true
+        dw = (X.T @ error) / n + self.l2_lambda * self.weights
+        db = np.mean(error)
+        return dw, db
+
+    def fit(self, X_train, y_train, X_val=None, y_val=None):
+        np.random.seed(self.random_state)
+        n_samples, n_features = X_train.shape
+
+        self.weights = np.random.randn(n_features) * np.sqrt(2.0 / n_features)
+        self.bias = 0.0
+        self.train_losses = []
+        self.val_losses = []
+
+        for epoch in range(self.num_epochs):
+            indices = np.random.permutation(n_samples)
+            X_shuffled = X_train[indices]
+            y_shuffled = y_train[indices]
+
+            # mini-batch weight updates, this is literally where the model learns
+            for start in range(0, n_samples, self.batch_size):
+                end = min(start + self.batch_size, n_samples)
+                X_batch = X_shuffled[start:end]
+                y_batch = y_shuffled[start:end]
+                y_pred_batch = self._forward(X_batch)
+                dw, db = self._compute_gradients(X_batch, y_batch, y_pred_batch)
+                self.weights -= self.learning_rate * dw
+                self.bias -= self.learning_rate * db
+
+            train_pred = self._forward(X_train)
+            train_loss = self._binary_cross_entropy(y_train, train_pred)
+            self.train_losses.append(train_loss)
+
+            if X_val is not None and y_val is not None:
+                val_pred = self._forward(X_val)
+                val_loss = self._binary_cross_entropy(y_val, val_pred)
+                self.val_losses.append(val_loss)
+
+            if self.verbose and (epoch + 1) % 100 == 0:
+                val_str = f"  val_loss={val_loss:.4f}" if self.val_losses else ""
+                print(f"  Epoch {epoch+1}/{self.num_epochs}  train_loss={train_loss:.4f}{val_str}")
+
+        return self
+
+    def predict_proba(self, X):
+        return self._forward(X)
+
+    def predict(self, X, threshold=0.5):
+        return (self.predict_proba(X) >= threshold).astype(int)
+
+    def get_params(self):
+        return {
+            "learning_rate": self.learning_rate,
+            "num_epochs": self.num_epochs,
+            "batch_size": self.batch_size,
+            "l2_lambda": self.l2_lambda,
+        }
+
+===== ./train.py =====
+import os
+import json
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+
+from models.logistic_regression import LogisticRegression
+from models.baseline import ThresholdBaseline
+
+DATA_PATH = "data/features.csv"
+LOG_PATH = "experiments.log"
+RESULTS_DIR = "results"
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+
+def normalize_splits(X_train, X_val, X_test):
+    mean = X_train.mean(axis=0)
+    std = X_train.std(axis=0)
+    std[std == 0] = 1.0
+    return (X_train - mean) / std, (X_val - mean) / std, (X_test - mean) / std
+
+
+def load_data(path):
+    df = pd.read_csv(path)
+    exclude = {"question_id", "label", "arc_split", "model_id", "task"}
+    feature_cols = [c for c in df.columns if c not in exclude
+                    and pd.api.types.is_numeric_dtype(df[c])]
+    X = df[feature_cols].values.astype(np.float64)
+    y = df["label"].values.astype(np.float64)
+    return X, y, feature_cols
+
+
+def log_experiment(params, metrics, model_name):
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "model": model_name,
+        "params": params,
+        "metrics": {k: round(float(v), 4) if isinstance(v, (int, float)) else v for k, v in metrics.items()},
+    }
+    with open(LOG_PATH, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    print(f"  Logged: {model_name} | acc={metrics['accuracy']:.4f} | f1={metrics['f1']:.4f} | auc={metrics.get('roc_auc', 0):.4f}")
+
+
+def evaluate(y_true, y_pred, y_prob):
+    return {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "f1": f1_score(y_true, y_pred, zero_division=0),
+        "roc_auc": roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.0,
+    }
+
+
+def run_grid_search(X_train, y_train, X_val, y_val, X_test, y_test):
+    # brute force grid search over lr x l2, not glamorous but gets the job done
+    learning_rates = [0.001, 0.01, 0.1]
+    l2_lambdas = [0.0, 0.01, 0.1]
+    best_val_f1, best_model, best_params = 0, None, None
+
+    print("\n=== Logistic Regression Grid Search ===")
+    for lr in learning_rates:
+        for l2 in l2_lambdas:
+            model = LogisticRegression(
+                learning_rate=lr,
+                num_epochs=500,
+                batch_size=32,
+                l2_lambda=l2,
+                verbose=False,
+            )
+            model.fit(X_train, y_train, X_val, y_val)
+            val_pred = model.predict(X_val)
+            val_prob = model.predict_proba(X_val)
+            val_metrics = evaluate(y_val, val_pred, val_prob)
+
+            params = model.get_params()
+            log_experiment(params, {**val_metrics, "split": "val"}, "LogisticRegression")
+
+            if val_metrics["f1"] > best_val_f1:
+                best_val_f1 = val_metrics["f1"]
+                best_model = model
+                best_params = params
+
+    print(f"\nBest params: {best_params}")
+    test_pred = best_model.predict(X_test)
+    test_prob = best_model.predict_proba(X_test)
+    test_metrics = evaluate(y_test, test_pred, test_prob)
+    log_experiment(best_params, {**test_metrics, "split": "test"}, "LogisticRegression_best")
+    print(f"Test results: {test_metrics}")
+
+    return best_model, test_metrics
+
+
+def run_baseline(X_train, y_train, X_val, y_val, X_test, y_test, feature_cols):
+    print("\n=== Threshold Baseline ===")
+    baseline = ThresholdBaseline(feature_names=feature_cols)
+    baseline.fit(X_train, y_train)
+
+    test_pred = baseline.predict(X_test)
+    test_prob = baseline.predict_proba(X_test)
+    metrics = evaluate(y_test, test_pred, test_prob)
+    log_experiment({"margin_threshold": baseline.margin_threshold}, metrics, "ThresholdBaseline")
+    return baseline, metrics
+
+
+def save_predictions(model, X_test, y_test, name):
+    preds = model.predict(X_test)
+    probs = model.predict_proba(X_test)
+    df = pd.DataFrame({"true": y_test, "pred": preds, "prob": probs})
+    path = os.path.join(RESULTS_DIR, f"{name}_predictions.csv")
+    df.to_csv(path, index=False)
+    print(f"Saved predictions to {path}")
+    return df
+
+#by ug
+def main():
+    print(f"Loading data from {DATA_PATH}...")
+    X, y, feature_cols = load_data(DATA_PATH)
+    print(f"  {X.shape[0]} samples, {X.shape[1]} features")
+    print(f"  Label balance: {int(y.sum())} positive / {len(y)} total ({y.mean():.2%})")
+
+    X_trainval, X_test, y_trainval, y_test = train_test_split(
+        X, y, test_size=0.15, random_state=42, stratify=y
+    )
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_trainval, y_trainval, test_size=0.15, random_state=42, stratify=y_trainval
+    )
+
+    X_train, X_val, X_test = normalize_splits(X_train, X_val, X_test)
+    print(f"  Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
+
+    best_model, lr_test_metrics = run_grid_search(X_train, y_train, X_val, y_val, X_test, y_test)
+    baseline, base_test_metrics = run_baseline(X_train, y_train, X_val, y_val, X_test, y_test, feature_cols)
+
+    save_predictions(best_model, X_test, y_test, "logistic_regression")
+    save_predictions(baseline, X_test, y_test, "baseline")
+
+    weights_df = pd.DataFrame({
+        "feature": feature_cols,
+        "weight": best_model.weights,
+    }).sort_values("weight", ascending=False)
+    weights_df.to_csv(os.path.join(RESULTS_DIR, "feature_weights.csv"), index=False)
+    print(f"\nFeature weights:\n{weights_df.to_string(index=False)}")
+
+    print("\n=== Final Comparison ===")
+    print(f"{'Model':<25} {'Accuracy':>10} {'F1':>10} {'ROC-AUC':>10}")
+    print("-" * 57)
+    for name, m in [("LogisticRegression", lr_test_metrics), ("ThresholdBaseline", base_test_metrics)]:
+        print(f"{name:<25} {m['accuracy']:>10.4f} {m['f1']:>10.4f} {m.get('roc_auc', 0):>10.4f}")
+
+    np.save(os.path.join(RESULTS_DIR, "train_losses.npy"), best_model.train_losses)
+    if best_model.val_losses:
+        np.save(os.path.join(RESULTS_DIR, "val_losses.npy"), best_model.val_losses)
+
+
+if __name__ == "__main__":
+    main()
+

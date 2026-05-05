@@ -1,0 +1,16 @@
+feature,weight
+math_acc,8.446279094303526
+bbh_acc,2.3535916834352815
+musr_acc,1.8619195137877047
+bbh_sub_logical_deduction_five_objects,1.269232736231724
+score_variance,1.090055680983053
+bbh_sub_object_counting,0.6458768870844306
+bbh_sub_causal_judgement,0.4937338689074174
+bbh_sub_boolean_expressions,0.04986491487617896
+bbh_sub_navigate,0.006698631523154074
+bbh_sub_logical_deduction_three_objects,-0.24457475696798425
+bbh_sub_date_understanding,-0.411177813989919
+bbh_sub_web_of_lies,-0.4257633188349789
+bbh_sub_logical_deduction_seven_objects,-0.5205734912349212
+bbh_sub_penguins_in_a_table,-0.5331912648363638
+mmlu_pro_acc,-9.504257928219683
