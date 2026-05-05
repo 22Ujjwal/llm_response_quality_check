@@ -1,6 +1,12 @@
 # Reasoning vs Memorization Classifier
 ## by Ujjwal Gupta 🫡
 
+## Report
+
+Full project report (PDF): [Ujjwal_Gupta_ML_report.pdf](Ujjwal_Gupta_ML_report.pdf)
+
+---
+
 LLMs get benchmarked constantly, but high scores don't always mean the model is actually reasoning.
 This project asks a real question: can a model's reasoning benchmark performance predict how well
 it does on GPQA (a graduate-level knowledge benchmark)?
